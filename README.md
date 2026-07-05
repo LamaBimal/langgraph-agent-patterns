@@ -15,8 +15,9 @@ A hands-on collection of AI agent implementations built with [LangGraph](https:/
 5. [Agent Descriptions](#agent-descriptions)
 6. [LangGraph Concepts](#langgraph-concepts)
 7. [Configuration](#configuration)
-8. [Suggested Enhancements](#suggested-enhancements)
-9. [License](#license)
+8. [Limitations](#limitations)
+9. [Enhancements](#enhancements)
+10. [License](#license)
 
 ---
 
@@ -298,14 +299,62 @@ python -m pytest tests/test_react_agent.py -v
 
 ---
 
-## Suggested Enhancements
+## Limitations
 
-The following improvements would make this project more robust and production-ready:
+These are known constraints of the current implementation:
 
-- **Multi-agent orchestration** — Route user intent to the appropriate agent via a supervisor/router agent combining RAG, Drafter, and ReAct into one system
-- **Session-persistent memory** — Extend `MemorySaver` to write checkpoints to disk (SQLite) so memory survives process restarts
-- **Streaming in RAG** — Wire the RAG agent's final answer through `.stream()` so the LLM output prints token-by-token instead of all at once
-- **More document formats** — Add loaders for `.docx`, `.txt`, and URLs alongside the existing PDF support
+**Model & Runtime**
+- All agents require [Ollama](https://ollama.com) running locally — there is no cloud LLM fallback
+- Response quality and speed depend entirely on the local hardware (RAM, GPU)
+- `llama3.1` with `num_predict=256` caps responses at ~256 tokens, which may truncate long answers — increase this in `.env` if needed
+- Model availability varies; if `llama3.1` is not pulled, agents will fail at startup unless `OLLAMA_VALIDATE_ON_INIT=false`
+
+**Memory Agent**
+- `MemorySaver` stores conversation state in-process memory only — it is lost when the Python process exits
+- Switching `thread_id` starts a completely fresh conversation with no access to prior sessions
+
+**RAG Agent**
+- Only supports PDF files currently; `.docx`, `.txt`, and web URLs are not handled
+- The Chroma vector store is rebuilt from scratch if the collection does not exist — on large documents this can be slow on first run
+- Retrieval quality depends on chunk size and overlap settings; poorly tuned values may return irrelevant passages
+- No re-ranking step — chunks are returned by raw similarity score only
+
+**ReAct Agent**
+- Web search via DuckDuckGo may return inconsistent results or be rate-limited under heavy use
+- Math tools only support integers; floating-point inputs will cause a validation error
+
+**Drafter Agent**
+- The `update` tool replaces the entire document on every call — there is no partial edit or diff support
+- No document version history; once overwritten, previous content is gone
+
+**General**
+- No authentication or access control on any agent
+- No support for concurrent users or multi-session isolation
+- Error messages from Ollama are sometimes opaque — check Ollama logs if an agent hangs silently
+
+---
+
+## Enhancements
+
+Planned and recommended improvements to make this project more robust and production-ready:
+
+**Short-term (low effort, high impact)**
+- **Disk-persistent memory** — Replace in-memory `MemorySaver` with a SQLite checkpointer so conversation history survives process restarts
+- **Streaming in RAG** — Wire the RAG agent's final answer through `.stream()` for token-by-token output instead of waiting for the full response
+- **Float support in ReAct tools** — Generalise the math tools to accept `float` in addition to `int`
+- **Partial document edits in Drafter** — Add an `edit` tool that accepts a search/replace pair instead of full rewrites
+
+**Medium-term**
+- **More document formats** — Add loaders for `.docx`, `.txt`, Markdown, and web URLs alongside the existing PDF support
+- **Re-ranking in RAG** — Add a cross-encoder re-ranker step after retrieval to improve passage relevance before sending to the LLM
+- **Multi-agent orchestration** — Build a router/supervisor agent that classifies user intent and delegates to the appropriate agent (RAG, Drafter, ReAct)
+- **LangSmith evaluation** — Use LangSmith datasets to benchmark RAG answer quality (faithfulness, relevance, groundedness)
+
+**Long-term**
+- **REST API layer** — Wrap agents in a FastAPI service so they can be consumed by a frontend or other services
+- **Web UI** — Add a lightweight Gradio or Streamlit interface for non-terminal users
+- **Docker support** — Containerise the project with Ollama as a sidecar so the setup is fully reproducible
+- **Authentication** — Add API key or OAuth protection if the agents are exposed over a network
 
 ---
 
