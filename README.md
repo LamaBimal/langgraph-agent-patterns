@@ -85,7 +85,7 @@ At minimum, set `PDF_PATH` in `.env` before running the RAG agent. All other val
 ```
 langgraph-agent-patterns/
 │
-├── src/
+├── agents/
 │   ├── config.py                   # Centralised config loader (.env → typed values)
 │   ├── simple_node_graph.py        # Minimal single-node graph (no LLM)
 │   ├── simple_ai_bot.py            # Single-turn LLM chatbot via LangGraph
@@ -125,22 +125,22 @@ Each agent is a standalone script. Run them from the project root:
 
 ```bash
 # 1. Simplest graph (no LLM, just state transformation)
-python src/simple_node_graph.py
+python agents/simple_node_graph.py
 
 # 2. Single-turn AI bot
-python src/simple_ai_bot.py
+python agents/simple_ai_bot.py
 
 # 3. Memory agent (multi-turn conversation, saves history to file)
-python src/memory_agent.py
+python agents/memory_agent.py
 
 # 4. ReAct agent (math tools: add, subtract, multiply)
-python src/ReAct_agent.py
+python agents/ReAct_agent.py
 
 # 5. Drafter agent (document creation and saving)
-python src/drafter_agent.py
+python agents/drafter_agent.py
 
 # 6. RAG agent (⚠️ requires PDF path config — see Configuration below)
-python src/RAG_agent.py
+python agents/RAG_agent.py
 ```
 
 ---

@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env from the project root (one level above src/)
+# Load .env from the project root (one level above agents/)
 _root = Path(__file__).resolve().parent.parent
 load_dotenv(_root / ".env")
 
