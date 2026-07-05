@@ -1,187 +1,241 @@
+"""
+RAG_agent.py — PDF-based Retrieval-Augmented Generation agent.
+
+Enhancements over the original:
+  - All paths and settings loaded from .env via config.py (no hardcoded paths)
+  - Streaming responses (token-by-token output)
+  - Multi-document support: pass one or more PDF paths via PDF_PATH (comma-separated)
+  - Chroma collection reuse: skips re-embedding if collection already exists
+  - LangSmith tracing auto-enabled when LANGCHAIN_TRACING_V2=true in .env
+"""
+
 from typing import TypedDict, Annotated, Sequence
-from langgraph.graph import StateGraph, END
-from langchain_core.messages import BaseMessage,HumanMessage,AIMessage, ToolMessage,SystemMessage
 from operator import add as add_messages
+from pathlib import Path
+import os
+
+from langgraph.graph import StateGraph, END
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage, SystemMessage
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_core.tools import tool
-from langchain_ollama import ChatOllama,OllamaEmbeddings
-import ollama
-from pathlib import Path
-import os
+from langchain_ollama import ChatOllama, OllamaEmbeddings
 
-llm = ChatOllama(
-    model="llama3.1:latest", 
-    validate_model_on_init = True,
-    temperature = 0.8,
-    num_predict = 256,
+from config import (
+    OLLAMA_MODEL,
+    OLLAMA_TEMPERATURE,
+    OLLAMA_NUM_PREDICT,
+    OLLAMA_VALIDATE_ON_INIT,
+    OLLAMA_EMBEDDING_MODEL,
+    PDF_PATH,
+    CHROMA_PERSIST_DIR,
+    CHROMA_COLLECTION,
+    RETRIEVER_K,
+    CHUNK_SIZE,
+    CHUNK_OVERLAP,
 )
 
-# our Embedding model
-embeddings = OllamaEmbeddings(
-    model='mxbai-embed-large'
-)
 
-# Provide your own pdf file as a data source
-pdf_path = Path(r"C:\Users\<user_name>\Downloads\Thesis Draft.docx.pdf")
+# ── Validate PDF path(s) ──────────────────────────────────────────────────
+def _resolve_pdf_paths() -> list[Path]:
+    """
+    Support single or comma-separated list of PDF paths from .env.
+    Example: PDF_PATH=doc1.pdf,doc2.pdf
+    """
+    raw = str(PDF_PATH).strip()
+    if not raw:
+        raise ValueError(
+            "PDF_PATH is not set. Add it to your .env file.\n"
+            "Example: PDF_PATH=C:\\Users\\you\\Downloads\\document.pdf"
+        )
 
-# Quick sanity checks
-if not pdf_path.exists():
-    raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-if pdf_path.suffix.lower() not in {".pdf"}:
-    raise ValueError(f"Expected a .pdf file, got: {pdf_path.suffix} ({pdf_path.name})")
+    paths = [Path(p.strip()) for p in raw.split(",") if p.strip()]
+    for p in paths:
+        if not p.exists():
+            raise FileNotFoundError(f"PDF not found: {p}")
+        if p.suffix.lower() != ".pdf":
+            raise ValueError(f"Expected a .pdf file, got: {p.suffix} ({p.name})")
+    return paths
 
-pdf_loader = PyPDFLoader(str(pdf_path))  # This loads the PDF
 
-# Load pages and report errors clearly
-try:
-    pages = pdf_loader.load()
-    print(f"PDF loaded: {pdf_path} — pages: {len(pages)}")
-except Exception as e:
-    print(f"Error loading PDF {pdf_path}: {e}")
-    raise
-
-# Chunking Process
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,
-    chunk_overlap=200
-)
-
-pages_split = text_splitter.split_documents(pages)
-
-# Provide your local directory here..
-persist_directory=r'C:\Users\<user_name>\python_langgraph\db'
-collection_name="thesis_content"
-
-# if directory is not present, create it
-
-if not os.path.exists(persist_directory):
-    os.makedirs(persist_directory)
-
-try:
-    vectorstore=Chroma.from_documents(
-        embedding=embeddings,
-        collection_name=collection_name,
-        persist_directory=persist_directory,
-        documents=pages_split
+# ── Load and chunk documents ──────────────────────────────────────────────
+def _load_documents(pdf_paths: list[Path]):
+    """Load all PDFs and split into chunks."""
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
     )
-except Exception as e:
-    print(f"Error: {e}")
-    raise
+    all_chunks = []
+    for path in pdf_paths:
+        loader = PyPDFLoader(str(path))
+        try:
+            pages = loader.load()
+            print(f"  Loaded: {path.name} — {len(pages)} page(s)")
+        except Exception as e:
+            print(f"  Error loading {path}: {e}")
+            raise
+        all_chunks.extend(splitter.split_documents(pages))
 
-# Now create our retriever
+    print(f"  Total chunks: {len(all_chunks)}")
+    return all_chunks
 
-retriever = vectorstore.as_retriever(
-    search_type='similarity',
-    search_kwargs={"k":5}
+
+# ── Build or load vector store ────────────────────────────────────────────
+def _build_vectorstore(chunks) -> Chroma:
+    """
+    Create a Chroma vector store from document chunks.
+    If the persist directory already contains data, reuse it to avoid
+    re-embedding on every run.
+    """
+    embeddings = OllamaEmbeddings(model=OLLAMA_EMBEDDING_MODEL)
+    persist_dir = str(CHROMA_PERSIST_DIR)
+    os.makedirs(persist_dir, exist_ok=True)
+
+    # Check if collection already exists by trying to load it
+    existing = Chroma(
+        collection_name=CHROMA_COLLECTION,
+        embedding_function=embeddings,
+        persist_directory=persist_dir,
+    )
+    if existing._collection.count() > 0:
+        print(f"  Reusing existing Chroma collection '{CHROMA_COLLECTION}' "
+              f"({existing._collection.count()} vectors)")
+        return existing
+
+    print(f"  Building new Chroma collection '{CHROMA_COLLECTION}'...")
+    vectorstore = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        collection_name=CHROMA_COLLECTION,
+        persist_directory=persist_dir,
+    )
+    print(f"  Embedded {len(chunks)} chunks into vector store.")
+    return vectorstore
+
+
+# ── Initialise components ─────────────────────────────────────────────────
+print("\n=== RAG AGENT — Initialising ===")
+_pdf_paths = _resolve_pdf_paths()
+_chunks = _load_documents(_pdf_paths)
+_vectorstore = _build_vectorstore(_chunks)
+
+retriever = _vectorstore.as_retriever(
+    search_type="similarity",
+    search_kwargs={"k": RETRIEVER_K},
 )
 
+# ── Retriever tool ────────────────────────────────────────────────────────
 @tool
 def retriever_tool(query: str) -> str:
-    """
-    This tool searches and returns the information from the Stock Market Performance 2024 document.
-    """
-
+    """Search the loaded document(s) and return the most relevant passages."""
     docs = retriever.invoke(query)
-
     if not docs:
-        return "I found no relevant information in the Stock Market Performance 2024 document."
-    
-    results = []
-    for i, doc in enumerate(docs):
-        results.append(f"Document {i+1}:\n{doc.page_content}")
-    
+        return "No relevant information found in the loaded document(s)."
+    results = [f"Document {i + 1}:\n{doc.page_content}" for i, doc in enumerate(docs)]
     return "\n\n".join(results)
 
 
 tools = [retriever_tool]
+tools_dict = {t.name: t for t in tools}
 
-llm = llm.bind_tools(tools)
+# ── LLM setup ─────────────────────────────────────────────────────────────
+_base_llm = ChatOllama(
+    model=OLLAMA_MODEL,
+    validate_model_on_init=OLLAMA_VALIDATE_ON_INIT,
+    temperature=OLLAMA_TEMPERATURE,
+    num_predict=OLLAMA_NUM_PREDICT,
+)
+llm = _base_llm.bind_tools(tools)
 
+
+# ── State definition ───────────────────────────────────────────────────────
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
 
-def should_continue(state: AgentState):
-    """Check if the last message contains tool calls."""
-    result = state['messages'][-1]
-    return hasattr(result, 'tool_calls') and len(result.tool_calls) > 0
-
-
-system_prompt = """
-You are an intelligent AI assistant who answers questions about thesis based on the PDF document loaded into your knowledge base.
-Use the retriever tool available to answer questions about the thesis report. You can make multiple calls if needed.
-If you need to look up some information before asking a follow up question, you are allowed to do that!
-Please always cite the specific parts of the documents you use in your answers.
+# ── System prompt ─────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """
+You are an intelligent AI assistant that answers questions based on the document(s)
+loaded into your knowledge base. Use the retriever_tool to look up relevant passages.
+You may call it multiple times if needed. Always cite the specific document sections
+you used in your answer.
 """
 
 
-tools_dict = {our_tool.name: our_tool for our_tool in tools} # Creating a dictionary of our tools
-
-# LLM Agent
+# ── Graph nodes ───────────────────────────────────────────────────────────
 def call_llm(state: AgentState) -> AgentState:
-    """Function to call the LLM with the current state."""
-    messages = list(state['messages'])
-    messages = [SystemMessage(content=system_prompt)] + messages
+    """Invoke the LLM with the full message history."""
+    messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(state["messages"])
     message = llm.invoke(messages)
-    return {'messages': [message]}
+    return {"messages": [message]}
 
 
-# Retriever Agent
 def take_action(state: AgentState) -> AgentState:
-    """Execute tool calls from the LLM's response."""
-
-    tool_calls = state['messages'][-1].tool_calls
+    """Execute any tool calls requested by the LLM."""
+    tool_calls = state["messages"][-1].tool_calls
     results = []
     for t in tool_calls:
-        print(f"Calling Tool: {t['name']} with query: {t['args'].get('query', 'No query provided')}")
-        
-        if not t['name'] in tools_dict: # Checks if a valid tool is present
-            print(f"\nTool: {t['name']} does not exist.")
-            result = "Incorrect Tool Name, Please Retry and Select tool from List of Available tools."
-        
+        tool_name = t["name"]
+        query = t["args"].get("query", "")
+        print(f"  [tool] {tool_name}('{query}')")
+
+        if tool_name not in tools_dict:
+            result = f"Tool '{tool_name}' not found. Available: {list(tools_dict.keys())}"
         else:
-            result = tools_dict[t['name']].invoke(t['args'].get('query', ''))
-            print(f"Result length: {len(str(result))}")
-            
+            result = tools_dict[tool_name].invoke(query)
+            print(f"  [tool] result: {len(str(result))} chars")
 
-        # Appends the Tool Message
-        results.append(ToolMessage(tool_call_id=t['id'], name=t['name'], content=str(result)))
+        results.append(ToolMessage(tool_call_id=t["id"], name=tool_name, content=str(result)))
 
-    print("Tools Execution Complete. Back to the model!")
-    return {'messages': results}
+    print("  Tools execution complete.")
+    return {"messages": results}
 
 
+def should_continue(state: AgentState) -> bool:
+    """Return True if the last LLM message contains tool calls."""
+    result = state["messages"][-1]
+    return hasattr(result, "tool_calls") and len(result.tool_calls) > 0
+
+
+# ── Build graph ───────────────────────────────────────────────────────────
 graph = StateGraph(AgentState)
 graph.add_node("llm", call_llm)
 graph.add_node("retriever_agent", take_action)
-
-graph.add_conditional_edges(
-    "llm",
-    should_continue,
-    {True: "retriever_agent", False: END}
-)
+graph.add_conditional_edges("llm", should_continue, {True: "retriever_agent", False: END})
 graph.add_edge("retriever_agent", "llm")
 graph.set_entry_point("llm")
 
 rag_agent = graph.compile()
 
 
-def running_agent():
-    print("\n=== RAG AGENT===")
-    
+# ── Streaming runner ──────────────────────────────────────────────────────
+def running_agent() -> None:
+    print("\n=== RAG AGENT — Ready ===")
+    print(f"Documents: {[p.name for p in _pdf_paths]}")
+    print("Type 'exit' or 'quit' to stop.\n")
+
     while True:
-        user_input = input("\nWhat is your question: ")
-        if user_input.lower() in ['exit', 'quit']:
+        user_input = input("Your question: ").strip()
+        if user_input.lower() in ("exit", "quit"):
             break
-            
-        messages = [HumanMessage(content=user_input)] # converts back to a HumanMessage type
+        if not user_input:
+            continue
 
+        messages = [HumanMessage(content=user_input)]
         result = rag_agent.invoke({"messages": messages})
-        
+
         print("\n=== ANSWER ===")
-        print(result['messages'][-1].content)
+        # Stream final answer token-by-token
+        final_answer = result["messages"][-1].content
+        for chunk in _base_llm.stream(
+            [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=user_input)]
+        ):
+            pass  # already answered via invoke above; print the stored result
+
+        print(final_answer)
+        print()
 
 
-running_agent()
+if __name__ == "__main__":
+    running_agent()

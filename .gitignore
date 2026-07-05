@@ -1,1 +1,27 @@
-.venv/*
+# Virtual environment
+.venv/
+
+# Environment variables — never commit secrets
+.env
+
+# Chroma vector store (can be rebuilt from source PDFs)
+db/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Pytest cache
+.pytest_cache/
+.coverage
+
+# Conversation output files
+conversation_history.txt
+*.txt
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
